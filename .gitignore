@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environment
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+wandb/
+
+# Temporary files
+.DS_Store
+*.tmp
+*.bak
+
+# Model links and local checkpoints
+model_links/
+checkpoints/
+models/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Large generated outputs
+results/compare_rerun/
+results/compare_api_test/
+:wqresults/*/analysis_payload/
+
+# Secrets
+.env
+*.key
