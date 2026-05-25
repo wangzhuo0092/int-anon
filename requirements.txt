@@ -13,6 +13,9 @@ tokenizers==0.22.2
 safetensors==0.7.0
 sentencepiece==0.2.1
 hf_transfer==0.1.9
+protobuf==6.33.5
+tiktoken==0.12.0
+einops==0.8.2
 
 # API inference
 openai==2.16.0
