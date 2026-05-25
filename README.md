@@ -237,7 +237,7 @@ The calibration subset sizes are:
 The optimization is repeated with five random seeds:
 
 ```text
-1, 2, 3, 4, 5
+42, 123, 3407, 2020, 2026
 ```
 
 The main hyperparameters are:
@@ -295,8 +295,6 @@ The metrics include:
 
 ## Notes
 
-- The repository is designed for anonymous review.
-- Do not include personal paths, usernames, institution names, or private model-cache locations.
 - The scripts use local model paths. Replace `/path/to/model` and `/path/to/model/cache` with your own local paths when running.
 - Large model checkpoints and raw model caches are not included.
 - API keys should be provided through environment variables and should never be committed.
