@@ -297,4 +297,4 @@ The metrics include:
 
 - The scripts use local model paths. Replace `/path/to/model` and `/path/to/model/cache` with your own local paths when running.
 - Large model checkpoints and raw model caches are not included.
-- API keys should be provided through environment variables and should never be committed.
+- API keys should be provided through environment variables.
