@@ -36,3 +36,4 @@ results/compare_api_test/
 # Secrets
 .env
 *.key
+*.bak_calib
