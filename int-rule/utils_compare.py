@@ -62,7 +62,14 @@ def load_H_y(data_path, zero_based=True, drop_last_layer=True, device=None):
     return H, y_h
 
 
-def load_H_targets(data_path, label_start, drop_last_layer=True, device=None):
+def load_H_targets(
+    data_path,
+    label_start,
+    drop_last_layer=True,
+    device=None,
+    exclude_idx=None,
+    return_idx=False,
+):
     """
     Load layer-wise logits and convert human annotations into distributions.
 
@@ -72,12 +79,18 @@ def load_H_targets(data_path, label_start, drop_last_layer=True, device=None):
         drop_last_layer: Whether to remove the final layer logits.
         device: Optional torch device.
 
+    Args:
+        exclude_idx: Optional set of sample ids to drop (e.g. the calibration
+            samples when the evaluation set must be held out). Ids come from the
+            `idx` field written by the logits-generation script.
+
     Returns:
         H: Tensor with shape [N, L, K].
         target_probs: Human rating distributions with shape [N, K].
         target_mean: Expected human scores with shape [N].
         target_label: Mode labels with shape [N].
         target_median: Median labels with shape [N].
+        idx: List of kept sample ids (only when return_idx=True).
     """
     with open(data_path, "r", encoding="utf-8") as f:
         all_data = json.load(f)
@@ -87,9 +100,14 @@ def load_H_targets(data_path, label_start, drop_last_layer=True, device=None):
     mean_list = []
     label_list = []
     median_list = []
+    idx_list = []
 
     for sample in all_data:
         if "weighted_socre" in sample and sample["weighted_socre"] == -1:
+            continue
+
+        sample_idx = sample.get("idx")
+        if exclude_idx and sample_idx in exclude_idx:
             continue
 
         if "human_score" in sample:
@@ -135,6 +153,7 @@ def load_H_targets(data_path, label_start, drop_last_layer=True, device=None):
         mean_list.append(mean)
         label_list.append(label)
         median_list.append(median)
+        idx_list.append(sample_idx)
 
     H = torch.stack(logits_list)
     target_probs = torch.stack(probs_list)
@@ -149,20 +168,33 @@ def load_H_targets(data_path, label_start, drop_last_layer=True, device=None):
         target_label = target_label.to(device)
         target_median = target_median.to(device)
 
+    if return_idx:
+        return H, target_probs, target_mean, target_label, target_median, idx_list
     return H, target_probs, target_mean, target_label, target_median
 
 
-def load_baseline_scores(data_path, label_start, device=None):
+def load_baseline_scores(
+    data_path,
+    label_start,
+    device=None,
+    exclude_idx=None,
+    return_idx=False,
+):
     """
     Load Raw scores and final-layer probability distributions.
 
     The original result files use legacy keys such as `direct_socre` and
     `weighted_socre`, so these keys are kept for compatibility.
 
+    Args:
+        exclude_idx: Optional set of sample ids to drop, matching the filtering
+            applied by load_H_targets so the two stay row-aligned.
+
     Returns:
         direct_score: Raw argmax scores with shape [N].
         e_score: Raw expected scores with shape [N].
         last_probs: Final-layer probability distributions with shape [N, K].
+        idx: List of kept sample ids (only when return_idx=True).
     """
     with open(data_path, "r", encoding="utf-8") as f:
         all_data = json.load(f)
@@ -170,9 +202,14 @@ def load_baseline_scores(data_path, label_start, device=None):
     direct_score_list = []
     e_score_list = []
     last_probs_list = []
+    idx_list = []
 
     for sample in all_data:
         if sample["weighted_socre"] == -1:
+            continue
+
+        sample_idx = sample.get("idx")
+        if exclude_idx and sample_idx in exclude_idx:
             continue
 
         if "human_score" in sample:
@@ -187,6 +224,7 @@ def load_baseline_scores(data_path, label_start, device=None):
         probs_dict = sample["df"]["probs"]
         last_idx = str(max(int(k) for k in probs_dict.keys()))
         last_probs_list.append(probs_dict[last_idx])
+        idx_list.append(sample_idx)
 
     if device is not None:
         direct_score = torch.tensor(direct_score_list, dtype=torch.float32, device=device)
@@ -197,6 +235,8 @@ def load_baseline_scores(data_path, label_start, device=None):
         e_score = np.array(e_score_list, dtype=float)
         last_probs = np.array(last_probs_list, dtype=float)
 
+    if return_idx:
+        return direct_score, e_score, last_probs, idx_list
     return direct_score, e_score, last_probs
 
 
@@ -1041,6 +1081,468 @@ def print_correlations(
 
     print(table)
     append_rows_to_csv(rows, save_csv_path)
+
+
+# ---------------------------------------------------------------
+# Metric helpers ported from LAGER/lager/main_compare.py so that main.py
+# can compute prob / mean / uncertainty tables. Kept verbatim apart from
+# quoting, which matches the rest of this module.
+# ---------------------------------------------------------------
+
+def js_divergence(p, q, eps=1e-12):
+    """
+    计算两个离散分布 p 和 q 的 Jensen-Shannon Divergence
+    p, q: shape [K]
+    返回值越小越好
+    """
+    p = p.detach().cpu().numpy() if isinstance(p, torch.Tensor) else np.asarray(p)
+    q = q.detach().cpu().numpy() if isinstance(q, torch.Tensor) else np.asarray(q)
+
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    p = p / p.sum()
+    q = q / q.sum()
+
+    m = 0.5 * (p + q)
+
+    kl_pm = np.sum(p * (np.log2(p) - np.log2(m)))
+    kl_qm = np.sum(q * (np.log2(q) - np.log2(m)))
+
+    jsd = 0.5 * kl_pm + 0.5 * kl_qm
+    return float(jsd)
+
+
+def compute_jsb(target_probs, pred_probs, bin_labels):
+    """
+    target_probs : [N, K] 人类目标分布
+    pred_probs   : [N, K]  模型预测分布
+    bin_labels   : [N]
+        分 bin 的标签：
+        - nominal 数据：建议用 target_label
+        - ordinal 数据：建议用 target_median
+    返回：
+    jsb : float
+        加权后的 binned JSD，越小越好
+    """
+    target_probs = target_probs.detach().cpu().numpy() if isinstance(target_probs, torch.Tensor) else np.asarray(target_probs)
+    pred_probs = pred_probs.detach().cpu().numpy() if isinstance(pred_probs, torch.Tensor) else np.asarray(pred_probs)
+    bin_labels = bin_labels.detach().cpu().view(-1).numpy().astype(int) if isinstance(bin_labels, torch.Tensor) else np.asarray(bin_labels).reshape(-1).astype(int)
+
+    N, K = target_probs.shape
+    unique_bins = np.unique(bin_labels)
+
+    jsb = 0.0
+    for r in unique_bins:
+        mask = (bin_labels == r)
+        if mask.sum() == 0:
+            continue
+
+        # 该 bin 内的人类总体分布 / 模型总体分布
+        # 这里用“bin 内平均分布”做近似
+        p_h = target_probs[mask].mean(axis=0)   # [K]
+        p_m = pred_probs[mask].mean(axis=0)     # [K]
+
+        bin_weight = mask.mean()   # |B_r| / N
+        jsb += bin_weight * js_divergence(p_h, p_m)
+
+    return float(jsb)
+
+
+def compute_metrics_from_probs(y_probs, target_label, target_probs=None, target_median=None, n_bins=10, strategy='quantile', eps=1e-12):
+    """
+    统一计算概率分布相关指标
+    参数：
+    y_probs : [N, K]  模型预测概率分布
+    target_label : [N] 众数标签 / hard label，要求是 0-based
+    target_probs : [N, K] or None 目标分布；单标签时是 one-hot，多标签时是经验分布
+    target_median : [N] or None 目标中位数标签（0-based），用于 ordinal 版 JSb
+    n_bins : int  calibration 分箱数
+    strategy : str  分箱策略，通常是 'quantile'
+    eps : float 数值稳定项，防止 log(0)
+    """
+    # === 转 numpy，便于后续统一计算 ===
+    y_probs = y_probs.detach().cpu().numpy() if isinstance(y_probs, torch.Tensor) else np.asarray(y_probs)
+    target_label = target_label.detach().cpu().view(-1).numpy().astype(int) \
+        if isinstance(target_label, torch.Tensor) else np.asarray(target_label).reshape(-1).astype(int)
+
+    # === 1. hard label 分类指标 ===
+    pred_label = y_probs.argmax(axis=1)
+    acc = float((pred_label == target_label).mean())
+
+    # === 2. 单标签 NLL：对众数标签 ===
+    true_probs = y_probs[np.arange(len(target_label)), target_label]
+    nll = float(-np.mean(np.log(np.clip(true_probs, eps, 1.0))))
+
+    # === 3. hard calibration：基于 target_label 的一对多校准 ===
+    calib, probs_true, probs_pred = calibration_curves(target_label, y_probs, n_bins=n_bins, strategy=strategy)
+
+    # === 4. 分布级指标初始化 ===
+    ce = None
+    calib_soft = None
+    jsb_nominal = None
+    jsb_ordinal = None
+
+    # === 5. 分布版 CE / soft calibration / JSb ===
+    if target_probs is not None:
+        target_probs = target_probs.detach().cpu().numpy() if isinstance(target_probs, torch.Tensor) else np.asarray(target_probs)
+        # 分布版 CE：对完整目标分布的 cross-entropy
+        ce = float(-np.mean(np.sum(target_probs * np.log(np.clip(y_probs, eps, 1.0)), axis=1)))
+        # soft calibration：基于 target_probs 的概率校准
+        calib_soft, _, _ = soft_calibration_curves(target_probs, y_probs, n_bins=n_bins, strategy=strategy)
+
+        # nominal 版 JSb：按 target_label 分 bin
+        jsb_nominal = compute_jsb(target_probs, y_probs, target_label)
+
+        # ordinal 版 JSb：按 target_median 分 bin
+        if target_median is not None:
+            target_median = target_median.detach().cpu().view(-1).numpy().astype(int) if isinstance(target_median, torch.Tensor) else np.asarray(target_median).reshape(-1).astype(int)
+            jsb_ordinal = compute_jsb(target_probs, y_probs, target_median)
+
+
+    # acc：预测众数标签是否正确
+    # nll：预测概率对众数标签的拟合程度
+    # ce：预测概率对完整人类分布的拟合程度
+    # calib：预测概率对众数标签的一对多校准情况
+    # calib_soft：预测概率对完整目标分布的 soft calibration
+    # jsb：按 bin 聚合后的人类分布与模型分布的 Jensen-Shannon Divergence，越小越好
+    return {
+        "acc": acc,
+        "nll": nll,
+        "ce": ce,
+        "calib": float(calib),
+        "calib_soft": None if calib_soft is None else float(calib_soft),
+        "jsb_nominal": jsb_nominal,
+        "jsb_ordinal": jsb_ordinal,
+        "probs_true": probs_true,
+        "probs_pred": probs_pred,
+    }
+
+
+def print_prob_metrics(prob_dict, target_label, target_probs=None, target_median=None,
+                       prob_names=None, n_bins=10, strategy='quantile',
+                       save_csv_path=None, model_name=None, dataset_name=None, valid_name=None):
+    """
+    prob_dict: {name: probs}，其中 probs 形状为 [N, K]
+    target_label: 0-based 标签 [N]
+    target_probs: [N, K]，目标分布；单标签时是 one-hot，多标签时是经验分布
+    target_median : [N] or None  目标中位数标签（0-based），用于 ordinal 版 JSb
+    """
+    if prob_names is None:
+        prob_names = list(prob_dict.keys())
+
+    table = PrettyTable(['prob_type', 'acc', 'nll', 'ce', 'calib', 'calib_soft', 'jsb_nominal', 'jsb_ordinal'])
+    rows = []
+
+    for name in prob_names:
+        result = compute_metrics_from_probs(
+            y_probs=prob_dict[name],
+            target_label=target_label,
+            target_probs=target_probs,
+            target_median=target_median,
+            n_bins=n_bins,
+            strategy=strategy
+        )
+
+        acc = round(result['acc'], 3)
+        nll = round(result['nll'], 3)
+        ce = round(result['ce'], 3) if result['ce'] is not None else None
+        calib = round(result['calib'], 3)
+        calib_soft = round(result['calib_soft'], 3) if result['calib_soft'] is not None else None
+        jsb_nominal = round(result['jsb_nominal'], 3) if result['jsb_nominal'] is not None else None
+        jsb_ordinal = round(result['jsb_ordinal'], 3) if result['jsb_ordinal'] is not None else None
+
+        table.add_row([name, acc, nll, ce, calib, calib_soft, jsb_nominal, jsb_ordinal])
+
+        rows.append({
+            'metric_group': 'prob',
+            'model_name': model_name,
+            'dataset_name': dataset_name,
+            'valid_name': valid_name,
+            'prob_type': name,
+            'acc': acc,
+            'nll': nll,
+            'ce': ce,
+            'calib': calib,
+            'calib_soft': calib_soft,
+            'jsb_nominal': jsb_nominal,
+            'jsb_ordinal': jsb_ordinal,
+        })
+
+    print(table)
+    append_rows_to_csv(rows, save_csv_path)
+
+
+def compute_mean_metrics(pred_score, target_mean, n_bins=10, strategy='quantile'):
+    """
+    pred_score : [N]  预测分数（0-based）
+    target_mean : [N]  目标分布期望（0-based）
+    """
+    pred_score = pred_score.detach().cpu().view(-1).numpy() if isinstance(pred_score, torch.Tensor) else np.asarray(pred_score).reshape(-1)
+    target_mean = target_mean.detach().cpu().view(-1).numpy() if isinstance(target_mean, torch.Tensor) else np.asarray(target_mean).reshape(-1)
+
+    # === 1. 点估计误差 ===
+    mse_mean = float(np.mean((pred_score - target_mean) ** 2))
+    mae_mean = float(np.mean(np.abs(pred_score - target_mean)))
+    # === 2. calib_mean：按预测分数分 bin，比较 bin 内平均预测值和平均真实值 ===
+    if strategy == 'quantile':
+        bin_edges = np.quantile(pred_score, np.linspace(0, 1, n_bins + 1))
+    else:
+        bin_edges = np.linspace(pred_score.min(), pred_score.max(), n_bins + 1)
+
+    bin_edges[0] = pred_score.min()
+    bin_edges[-1] = pred_score.max()
+    pred_bin_means = []
+    true_bin_means = []
+
+    for i in range(n_bins):
+        left, right = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (pred_score >= left) & (pred_score <= right)
+        else:
+            mask = (pred_score >= left) & (pred_score < right)
+        if mask.sum() == 0:
+            continue
+
+        pred_bin_means.append(pred_score[mask].mean())
+        true_bin_means.append(target_mean[mask].mean())
+
+    if len(pred_bin_means) == 0:
+        calib_mean = np.nan
+    else:
+        pred_bin_means = np.array(pred_bin_means)
+        true_bin_means = np.array(true_bin_means)
+        calib_mean = float(np.mean(np.abs(pred_bin_means - true_bin_means)))
+
+    return {
+        "mse_mean": mse_mean,
+        "mae_mean": mae_mean,
+        "calib_mean": calib_mean,
+    }
+
+
+def print_mean_metrics(score_dict, target_mean, score_names=None, n_bins=10, strategy='quantile',
+                       save_csv_path=None, model_name=None, dataset_name=None, valid_name=None):
+    """
+    score_dict : {name: score}
+        每个 score 的形状都是 [N]
+    target_mean : [N]
+        目标分布期望（0-based）
+    """
+    if score_names is None:
+        score_names = list(score_dict.keys())
+
+    table = PrettyTable(['score_type', 'mse_mean', 'mae_mean', 'calib_mean'])
+    rows = []
+
+    for name in score_names:
+        result = compute_mean_metrics(
+            pred_score=score_dict[name],
+            target_mean=target_mean,
+            n_bins=n_bins,
+            strategy=strategy
+        )
+
+        mse_mean = round(result['mse_mean'], 3)
+        mae_mean = round(result['mae_mean'], 3)
+        calib_mean = round(result['calib_mean'], 3) if not np.isnan(result['calib_mean']) else None
+
+        table.add_row([name, mse_mean, mae_mean, calib_mean])
+
+        rows.append({
+            'metric_group': 'mean',
+            'model_name': model_name,
+            'dataset_name': dataset_name,
+            'valid_name': valid_name,
+            'score_type': name,
+            'mse_mean': mse_mean,
+            'mae_mean': mae_mean,
+            'calib_mean': calib_mean,
+        })
+
+    print(table)
+    append_rows_to_csv(rows, save_csv_path)
+
+
+def compute_uncertainty_metrics_table(
+    all_score_dict, prob_dict, score_dict,
+    target_mean, target_label, target_probs, target_median,
+    model_name, dataset_name, valid_name,
+    scheme_name="main", n_bins=10, strategy="quantile"
+):
+    """
+    按 human uncertainty 分 bin 生成新表：
+    - PA = max(target_probs)
+    - unique_count = target_probs 中非 0 的个数
+    主表:
+        PA = 1
+        0.65 <= PA < 1
+        PA < 0.65
+    附录:
+        PA = 1.0
+        0.8 <= PA < 1.0
+        0.6 <= PA < 0.8
+        0.4 <= PA < 0.6
+        0.2 <= PA < 0.4
+        PA < 0.2
+    """
+    target_mean = target_mean.detach().cpu().view(-1).numpy() if isinstance(target_mean, torch.Tensor) else np.asarray(target_mean).reshape(-1)
+    target_label = target_label.detach().cpu().view(-1).numpy() if isinstance(target_label, torch.Tensor) else np.asarray(target_label).reshape(-1)
+    target_probs = target_probs.detach().cpu().numpy() if isinstance(target_probs, torch.Tensor) else np.asarray(target_probs)
+    target_median = target_median.detach().cpu().view(-1).numpy() if isinstance(target_median, torch.Tensor) else np.asarray(target_median).reshape(-1)
+
+    pa = target_probs.max(axis=1)
+    unique_count = (target_probs > 0).sum(axis=1)
+
+    if scheme_name == "main":
+        uncertainty_bins = np.where(np.isclose(pa, 1.0), "PA=1", np.where(pa >= 0.65, "0.65<=PA<1", "PA<0.65"))
+    elif scheme_name == "appendix":
+        uncertainty_bins = np.where(
+            np.isclose(pa, 1.0), "PA=1.0",
+            np.where(pa >= 0.8, "0.8<=PA<1.0",
+            np.where(pa >= 0.6, "0.6<=PA<0.8",
+            np.where(pa >= 0.4, "0.4<=PA<0.6",
+            np.where(pa >= 0.2, "0.2<=PA<0.4", "PA<0.2"))))
+        )
+    else:
+        raise ValueError(f"unknown scheme_name: {scheme_name}")
+
+    bin_names = list(dict.fromkeys(uncertainty_bins.tolist()))
+    N = len(pa)
+    rows = []
+
+    for bin_name in bin_names:
+        mask = (uncertainty_bins == bin_name)
+        bin_ratio = round(float(mask.mean()), 4) if N > 0 else None
+        pa_mean = round(float(pa[mask].mean()), 4) if mask.sum() > 0 else None
+        unique_count_mean = round(float(unique_count[mask].mean()), 4) if mask.sum() > 0 else None
+
+        # 1. correlation
+        for score_name, pred_score in all_score_dict.items():
+            pred_score = pred_score.detach().cpu().view(-1).numpy() if isinstance(pred_score, torch.Tensor) else np.asarray(pred_score).reshape(-1)
+            try:
+                pearson = round(calc_corr(pred_score[mask], target_mean[mask], 'pearson'), 3)
+            except Exception:
+                pearson = None
+            try:
+                spearman = round(calc_corr(pred_score[mask], target_mean[mask], 'spearman'), 3)
+            except Exception:
+                spearman = None
+
+            rows.append({
+                "metric_group": "uncertainty_correlation",
+                "model_name": model_name,
+                "dataset_name": dataset_name,
+                "valid_name": valid_name,
+                "bin_scheme": scheme_name,
+                "uncertainty_bin": bin_name,
+                "bin_ratio": bin_ratio,
+                "pa_mean": pa_mean,
+                "unique_count_mean": unique_count_mean,
+                "item_name": score_name,
+                "pearson": pearson,
+                "spearman": spearman,
+            })
+
+        # 2. prob
+        for prob_name, y_probs in prob_dict.items():
+            y_probs = y_probs.detach().cpu().numpy() if isinstance(y_probs, torch.Tensor) else np.asarray(y_probs)
+            try:
+                result = compute_metrics_from_probs(
+                    y_probs=y_probs[mask],
+                    target_label=target_label[mask],
+                    target_probs=target_probs[mask],
+                    target_median=target_median[mask],
+                    n_bins=n_bins,
+                    strategy=strategy
+                )
+            except Exception:
+                result = {"acc": None, "nll": None, "ce": None, "calib": None, "calib_soft": None, "jsb_nominal": None, "jsb_ordinal": None}
+
+            rows.append({
+                "metric_group": "uncertainty_prob",
+                "model_name": model_name,
+                "dataset_name": dataset_name,
+                "valid_name": valid_name,
+                "bin_scheme": scheme_name,
+                "uncertainty_bin": bin_name,
+                "bin_ratio": bin_ratio,
+                "pa_mean": pa_mean,
+                "unique_count_mean": unique_count_mean,
+                "item_name": prob_name,
+                "acc": round(result["acc"], 3) if result["acc"] is not None else None,
+                "nll": round(result["nll"], 3) if result["nll"] is not None else None,
+                "ce": round(result["ce"], 3) if result["ce"] is not None else None,
+                "calib": round(result["calib"], 3) if result["calib"] is not None else None,
+                "calib_soft": round(result["calib_soft"], 3) if result["calib_soft"] is not None else None,
+                "jsb_nominal": round(result["jsb_nominal"], 3) if result["jsb_nominal"] is not None else None,
+                "jsb_ordinal": round(result["jsb_ordinal"], 3) if result["jsb_ordinal"] is not None else None,
+            })
+
+        # 3. mean
+        for score_name, pred_score in score_dict.items():
+            pred_score = pred_score.detach().cpu().view(-1).numpy() if isinstance(pred_score, torch.Tensor) else np.asarray(pred_score).reshape(-1)
+            try:
+                result = compute_mean_metrics(
+                    pred_score=pred_score[mask],
+                    target_mean=target_mean[mask],
+                    n_bins=n_bins,
+                    strategy=strategy
+                )
+            except Exception:
+                result = {"mse_mean": None, "mae_mean": None, "calib_mean": None}
+
+            rows.append({
+                "metric_group": "uncertainty_mean",
+                "model_name": model_name,
+                "dataset_name": dataset_name,
+                "valid_name": valid_name,
+                "bin_scheme": scheme_name,
+                "uncertainty_bin": bin_name,
+                "bin_ratio": bin_ratio,
+                "pa_mean": pa_mean,
+                "unique_count_mean": unique_count_mean,
+                "item_name": score_name,
+                "mse_mean": round(result["mse_mean"], 3) if result["mse_mean"] is not None else None,
+                "mae_mean": round(result["mae_mean"], 3) if result["mae_mean"] is not None else None,
+                "calib_mean": round(result["calib_mean"], 3) if result["calib_mean"] is not None and not np.isnan(result["calib_mean"]) else None,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def print_uncertainty_metrics(
+    all_score_dict, prob_dict, score_dict,
+    target_mean, target_label, target_probs, target_median,
+    model_name=None, dataset_name=None, valid_name=None,
+    scheme_name="main", n_bins=10, strategy="quantile",
+    save_csv_path=None
+):
+    df = compute_uncertainty_metrics_table(
+        all_score_dict=all_score_dict,
+        prob_dict=prob_dict,
+        score_dict=score_dict,
+        target_mean=target_mean,
+        target_label=target_label,
+        target_probs=target_probs,
+        target_median=target_median,
+        model_name=model_name,
+        dataset_name=dataset_name,
+        valid_name=valid_name,
+        scheme_name=scheme_name,
+        n_bins=n_bins,
+        strategy=strategy,
+    )
+
+    print("\n[uncertainty metrics]")
+    print(df.to_string(index=False))
+
+    if save_csv_path is not None:
+        write_header = not os.path.exists(save_csv_path)
+        df.to_csv(save_csv_path, mode="a", header=write_header, index=False, encoding="utf-8-sig")
+
+    return df
+
+# JSb / binned JSD 指标
 
 
 def calibration_curves(target_label, y_probs, n_bins=10, strategy="quantile"):

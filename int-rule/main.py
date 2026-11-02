@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import json
 import os
 import random
 import numpy as np
@@ -21,6 +22,13 @@ from utils_compare import (
     print_mean_metrics,
     print_uncertainty_metrics,
 )
+
+
+def load_idx_set(path):
+    """Return the set of sample ids stored in a result/calibration JSON file."""
+    with open(path, "r", encoding="utf-8") as f:
+        rows = json.load(f)
+    return {int(row["idx"]) for row in rows if row.get("idx") is not None}
 
 
 def set_global_seed(seed):
@@ -266,9 +274,11 @@ if __name__ == "__main__":
                 api_uncertainty_csv_path if is_api_model else uncertainty_csv_path
             )
 
+            # The `_heldout` tag keeps holdout results from colliding with any
+            # payload produced before calibration samples were removed.
             analysis_save_path = os.path.join(
                 cur_analysis_save_dir,
-                f"{prefix}_{dataset_name}_{valid_name_with_seed}_analysis.pt",
+                f"{prefix}_{dataset_name}_{valid_name_with_seed}_heldout_analysis.pt",
             )
 
             if os.path.exists(analysis_save_path):
@@ -279,47 +289,91 @@ if __name__ == "__main__":
             # 7. Load evaluation data
             # =========================
 
+            # Calibration samples must not appear in the evaluation set:
+            # collect their ids from the calibration file used by this task.
+            calibration_idx = load_idx_set(valid_data_path)
+
             cache_key = (dataset_name, fname)
 
             if cache_key not in eval_cache:
                 (
-                    H_eval,
-                    target_probs_eval,
-                    target_mean_eval,
-                    target_label_eval,
-                    target_median_eval,
+                    H_full,
+                    target_probs_full,
+                    target_mean_full,
+                    target_label_full,
+                    target_median_full,
+                    eval_idx,
                 ) = load_H_targets(
                     data_path,
                     label_start,
                     drop_last_layer=drop_last_layer,
                     device=device,
+                    return_idx=True,
                 )
 
-                raw_label, raw_score, raw_probs = load_baseline_scores(
-                    data_path,
-                    label_start,
-                    device=device,
+                raw_label_full, raw_score_full, raw_probs_full, raw_idx = (
+                    load_baseline_scores(
+                        data_path,
+                        label_start,
+                        device=device,
+                        return_idx=True,
+                    )
                 )
+
+                if eval_idx != raw_idx:
+                    raise ValueError(
+                        "Evaluation row order mismatch between layer logits "
+                        f"and baseline scores for {data_path}"
+                    )
 
                 eval_cache[cache_key] = {
-                    "H_eval": H_eval,
-                    "target_probs_eval": target_probs_eval,
-                    "target_mean_eval": target_mean_eval,
-                    "target_label_eval": target_label_eval,
-                    "target_median_eval": target_median_eval,
-                    "raw_label": raw_label,
-                    "raw_score": raw_score,
-                    "raw_probs": raw_probs,
+                    "H_full": H_full,
+                    "target_probs_full": target_probs_full,
+                    "target_mean_full": target_mean_full,
+                    "target_label_full": target_label_full,
+                    "target_median_full": target_median_full,
+                    "raw_label_full": raw_label_full,
+                    "raw_score_full": raw_score_full,
+                    "raw_probs_full": raw_probs_full,
+                    "eval_idx": eval_idx,
                 }
 
-            H_eval = eval_cache[cache_key]["H_eval"]
-            target_probs_eval = eval_cache[cache_key]["target_probs_eval"]
-            target_mean_eval = eval_cache[cache_key]["target_mean_eval"]
-            target_label_eval = eval_cache[cache_key]["target_label_eval"]
-            target_median_eval = eval_cache[cache_key]["target_median_eval"]
-            raw_label = eval_cache[cache_key]["raw_label"]
-            raw_score = eval_cache[cache_key]["raw_score"]
-            raw_probs = eval_cache[cache_key]["raw_probs"]
+            cached = eval_cache[cache_key]
+            eval_idx = cached["eval_idx"]
+
+            keep_mask = torch.tensor(
+                [sample_idx not in calibration_idx for sample_idx in eval_idx],
+                dtype=torch.bool,
+                device=device,
+            )
+            keep = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+
+            n_removed = int(keep_mask.numel() - keep.numel())
+            missing = calibration_idx - set(eval_idx)
+            if missing:
+                print(
+                    f"[warn] {len(missing)} calibration ids are absent from the "
+                    f"evaluation file (e.g. filtered out at generation time)"
+                )
+            if keep.numel() == 0:
+                raise ValueError(
+                    f"All evaluation samples were removed by calibration idx "
+                    f"from {valid_data_path}"
+                )
+
+            H_eval = cached["H_full"].index_select(0, keep)
+            target_probs_eval = cached["target_probs_full"].index_select(0, keep)
+            target_mean_eval = cached["target_mean_full"].index_select(0, keep)
+            target_label_eval = cached["target_label_full"].index_select(0, keep)
+            target_median_eval = cached["target_median_full"].index_select(0, keep)
+            raw_label = cached["raw_label_full"].index_select(0, keep)
+            raw_score = cached["raw_score_full"].index_select(0, keep)
+            raw_probs = cached["raw_probs_full"].index_select(0, keep)
+
+            print(
+                f"evaluation set: {keep_mask.numel()} rows -> {keep.numel()} "
+                f"after removing {n_removed} calibration samples"
+            )
 
             # =========================
             # 8. Learn or assign layer weights
@@ -783,6 +837,10 @@ if __name__ == "__main__":
                     "label_start": label_start,
                     "is_api_model": is_api_model,
                     "drop_last_layer": drop_last_layer,
+                    "calibration_held_out": True,
+                    "n_calibration_samples": len(calibration_idx),
+                    "n_eval_samples": int(target_probs_eval.size(0)),
+                    "n_eval_samples_before_holdout": len(eval_idx),
                     "hyperparameters": {
                         "layer_weight_epochs": layer_weight_epochs,
                         "layer_weight_lr": layer_weight_lr,
