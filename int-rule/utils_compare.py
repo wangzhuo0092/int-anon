@@ -399,6 +399,12 @@ def pred_human(
     return z_l_pred.float(), pred_probs.float(), pred_label, pred_score.float()
 
 
+def model_reconstruction_kl(target, predicted):
+    """Mean KL(target || predicted), retaining gradients through both inputs."""
+    return (target * (target.clamp_min(1e-12).log()
+                      - predicted.clamp_min(1e-12).log())).sum(dim=1).mean()
+
+
 def fit_eta_z_from_P(
     P,
     num_steps=2000,
@@ -443,7 +449,7 @@ def fit_eta_z_from_P(
         eta = build_eta(eta_free).double()
         pred = ordinal_probs(eta.float(), z_l.float()).double()
 
-        loss = F.smooth_l1_loss(pred, P, beta=beta_smoothl1)
+        loss = model_reconstruction_kl(P, pred)
         loss.backward()
         optimizer.step()
         scheduler.step(loss.item())
@@ -468,7 +474,7 @@ def fit_eta_z_from_P(
             lbfgs.zero_grad()
             eta = build_eta(eta_free).double()
             pred = ordinal_probs(eta.float(), z_l.float()).double()
-            loss = F.smooth_l1_loss(pred, P, beta=beta_smoothl1)
+            loss = model_reconstruction_kl(P, pred)
             loss.backward()
             return loss
 
@@ -896,6 +902,128 @@ def pred_human_from_probs(
             print("Final-Rule++ model-side reconstruction MAE:", recon_mae)
 
     return z_l_pred.float(), pred_probs.float(), pred_label, pred_score.float()
+
+
+def train_bridge_from_last_probs_mean_joint(
+    H,
+    target_probs,
+    w_init=None,
+    num_outer_iters=50,
+    num_steps_B=100,
+    num_steps_C=100,
+    lr_B=1e-2,
+    lr_C=1e-2,
+    lambda_ord=0.0,
+    ord_type=None,
+    verbose=True,
+):
+    """
+    Train Int-Rule with joint layer-weight and human-side calibration updates.
+
+    Unlike train_bridge_from_last_probs_mean, this function takes the full
+    layer-wise logits H instead of a pre-aggregated distribution P, so the
+    calibration loss can propagate back to the layer weights.
+
+    At each outer iteration:
+      Step B: fix w_raw, compute z_l = E-score of current aggregated probs,
+              update alpha_free and beta_raw with human_loss.
+      Step C: fix alpha_free and beta_raw, update w_raw so that the
+              human_loss (using the z_l implied by the new w) decreases.
+
+    Args:
+        H: Layer-wise logits with shape [N, L, K].
+        target_probs: Human rating distributions with shape [N, K].
+        w_init: Optional initial layer weights of shape [L]. When None,
+                uniform weights are used as the starting point.
+    """
+    device = H.device
+    H = H.float()
+    target_probs = target_probs.to(device).float()
+
+    num_samples, num_layers, num_classes = H.shape
+    levels = torch.arange(num_classes, device=device, dtype=H.dtype)
+
+    if w_init is None:
+        w_raw = Parameter(torch.zeros(num_layers, device=device))
+    else:
+        w_raw = Parameter(torch.log(w_init.to(device).float() + 1e-12))
+
+    alpha_free = Parameter(torch.zeros(num_classes - 1, device=device))
+    beta_raw = Parameter(torch.tensor(0.0, device=device))
+
+    opt_B = Adam([alpha_free, beta_raw], lr=lr_B)
+    opt_C = Adam([w_raw], lr=lr_C)
+
+    def current_z_l(w_raw_):
+        w = torch.softmax(w_raw_, dim=0)
+        fused_logits = (H * w.view(1, -1, 1)).sum(dim=1)  # [N, K]
+        probs = torch.softmax(fused_logits, dim=1)         # [N, K]
+        return (probs * levels.view(1, -1)).sum(dim=1)     # [N]
+
+    w = torch.softmax(w_raw, dim=0)
+    alpha = build_alpha(alpha_free)
+    beta = F.softplus(beta_raw) + 1e-6
+
+    for outer in range(num_outer_iters):
+        # Step B: fix w_raw, update human-side parameters
+        z_l = current_z_l(w_raw).detach()
+        for _ in range(num_steps_B):
+            opt_B.zero_grad()
+            loss_B = human_loss(
+                target_probs=target_probs,
+                alpha_free=alpha_free,
+                z_l=z_l,
+                beta_raw=beta_raw,
+                lambda_ord=lambda_ord,
+                ord_type=ord_type,
+            )
+            loss_B.backward()
+            opt_B.step()
+
+        # Step C: fix alpha_free and beta_raw, update w_raw via human loss
+        for _ in range(num_steps_C):
+            opt_C.zero_grad()
+            z_l_c = current_z_l(w_raw)   # differentiable w.r.t. w_raw
+            loss_C = human_loss(
+                target_probs=target_probs,
+                alpha_free=alpha_free.detach(),
+                z_l=z_l_c,
+                beta_raw=beta_raw.detach(),
+                lambda_ord=lambda_ord,
+                ord_type=ord_type,
+            )
+            loss_C.backward()
+            opt_C.step()
+
+        with torch.no_grad():
+            w = torch.softmax(w_raw, dim=0)
+            alpha = build_alpha(alpha_free)
+            beta = F.softplus(beta_raw) + 1e-6
+
+            if verbose:
+                z_l_v = current_z_l(w_raw)
+                pred_probs = ordinal_probs(alpha, z_l_v / beta)
+                pred_label = pred_probs.argmax(dim=1)
+                target_label = target_probs.argmax(dim=1)
+                train_acc = (pred_label == target_label).float().mean()
+                cur_human = human_loss(
+                    target_probs, alpha_free, z_l_v, beta_raw,
+                    lambda_ord=lambda_ord, ord_type=ord_type,
+                )
+                print(f"[Int-Rule joint] outer={outer}")
+                print(f"  human_loss = {cur_human.item():.6f}")
+                print(f"  train_acc = {train_acc.item():.4f}")
+                print(f"  latent_score mean/std = "
+                      f"{z_l_v.mean().item():.4f} / {z_l_v.std().item():.4f}")
+                print(f"  alpha = {alpha}")
+                print(f"  beta = {beta.item():.4f}")
+                print("-" * 50)
+
+    return {
+        "w": w.detach(),
+        "alpha": alpha.detach(),
+        "beta": beta.detach(),
+    }
 
 
 def train_bridge_from_last_probs_mean(

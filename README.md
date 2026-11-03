@@ -215,13 +215,13 @@ This script evaluates the following methods:
 The output files are saved under:
 
 ```text
-results/compare_rerun/
+results/compare_cdf_kl/
 ```
 
 For API-based results, outputs are saved under:
 
 ```text
-results/compare_api_test/
+results/compare_api_cdf_kl/
 ```
 
 ---
@@ -234,10 +234,11 @@ The calibration subset sizes are:
 20, 40, 80, 160, 320
 ```
 
-The optimization is repeated with five random seeds:
+Each available calibration file is used with five optimization seeds (these
+are not five independently sampled calibration subsets):
 
 ```text
-42, 123, 3407, 2020, 2026
+1, 2, 3, 4, 5
 ```
 
 The main hyperparameters are:
@@ -279,6 +280,14 @@ and analysis payloads under:
 ```text
 analysis_payload/
 ```
+
+The RULE variants reconstruct model-side thresholds with KL(model distribution
+|| reconstructed distribution) and calibrate the instance-specific CDF in
+sigmoid coordinates. This KL objective differs from the cross-entropy described
+in the paper when the model distribution is jointly optimized. Evaluation samples
+whose `idx` appears in the calibration file are excluded from all metrics.
+For each calibration size the bundled example provides one calibration subset;
+the five seeds repeat optimization on that same subset.
 
 The metrics include:
 

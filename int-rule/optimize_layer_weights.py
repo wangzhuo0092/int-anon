@@ -162,9 +162,7 @@ def optimize_layer_weights(
     """
     Learn simplex layer weights for Int-Logit-W.
 
-    The objective combines:
-        1. soft cross-entropy against the human rating distribution;
-        2. MSE between the predicted expected score and the human expected score.
+    The objective is soft cross-entropy against the human rating distribution.
 
     Args:
         data_path: Path to the calibration result file.
@@ -196,12 +194,7 @@ def optimize_layer_weights(
         torch.zeros(num_layers, device=device),
         requires_grad=True,
     )
-    loss_mix_raw = torch.nn.Parameter(
-        torch.tensor([0.5], device=device),
-        requires_grad=True,
-    )
-
-    optimizer = optim.Adam([layer_weight_raw, loss_mix_raw], lr=lr)
+    optimizer = optim.Adam([layer_weight_raw], lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -225,7 +218,6 @@ def optimize_layer_weights(
             batch_target_probs = batch_target_probs.to(device)
             batch_target_mean = batch_target_mean.to(device)
 
-            loss_mix = torch.sigmoid(loss_mix_raw)
             layer_weights = torch.softmax(layer_weight_raw, dim=0)
 
             fused_logits = (batch_logits * layer_weights.view(1, -1, 1)).sum(dim=1)
@@ -236,8 +228,7 @@ def optimize_layer_weights(
                 batch_target_probs * torch.log(pred_probs.clamp_min(1e-12))
             ).sum(dim=1).mean()
 
-            loss_mse = F.mse_loss(pred_mean, batch_target_mean)
-            loss = loss_mix * loss_ce + (1.0 - loss_mix) * loss_mse
+            loss = loss_ce
 
             optimizer.zero_grad()
             loss.backward()

@@ -11,16 +11,15 @@ from utils_compare import (
     load_baseline_scores,
     ordinal_probs,
     fit_eta_z_from_P,
-    train_bridge_alternating,
-    train_bridge_from_probs,
-    train_bridge_from_last_probs_mean,
-    pred_human,
-    pred_human_from_probs,
-    pred_human_from_last_probs_mean,
     print_correlations,
     print_prob_metrics,
     print_mean_metrics,
     print_uncertainty_metrics,
+)
+from cdf_rule import (
+    train_bridge_alternating, train_bridge_from_probs,
+    train_bridge_from_last_probs_mean, train_bridge_from_last_probs_mean_joint,
+    pred_human, pred_human_from_probs, pred_human_from_last_probs_mean,
 )
 
 
@@ -52,13 +51,13 @@ if __name__ == "__main__":
     result_root = os.environ.get("RESULT_ROOT", "/path/to/results")
     valid_root = os.path.join(result_root, "valid")
 
-    compare_save_dir = os.path.join(result_root, "compare_rerun")
+    compare_save_dir = os.path.join(result_root, "compare_cdf_kl")
     os.makedirs(compare_save_dir, exist_ok=True)
 
     analysis_save_dir = os.path.join(compare_save_dir, "analysis_payload")
     os.makedirs(analysis_save_dir, exist_ok=True)
 
-    api_compare_save_dir = os.path.join(result_root, "compare_api_test")
+    api_compare_save_dir = os.path.join(result_root, "compare_api_cdf_kl")
     os.makedirs(api_compare_save_dir, exist_ok=True)
 
     api_analysis_save_dir = os.path.join(api_compare_save_dir, "analysis_payload")
@@ -589,18 +588,22 @@ if __name__ == "__main__":
             # =========================
 
             if not is_api_model:
-                int_rule_result = train_bridge_from_last_probs_mean(
-                    P=int_logit_w_probs_valid,
+                int_rule_result = train_bridge_from_last_probs_mean_joint(
+                    H=H_valid,
                     target_probs=target_probs_valid,
+                    w_init=layer_weights,
                     num_outer_iters=num_outer_iters,
                     num_steps_B=num_steps_B,
+                    num_steps_C=num_steps_C,
                     lr_B=lr_B,
+                    lr_C=lr_C,
                     lambda_ord=0.0,
                     ord_type="emd",
                     verbose=True,
                 )
 
                 print("\nInt-Rule training finished")
+                print("Int-Rule layer weights =", int_rule_result["w"])
                 print("Int-Rule human-side thresholds =", int_rule_result["alpha"])
                 print("Int-Rule scale =", int_rule_result["beta"])
                 print("=" * 60)
@@ -703,8 +706,11 @@ if __name__ == "__main__":
                 )
 
                 with torch.no_grad():
+                    # Use the jointly updated layer weights from Int-Rule training,
+                    # not the initial layer_weights from step 6.
+                    int_rule_w = int_rule_result["w"].to(device)
                     int_logit_w_logits_eval = (
-                        H_eval * layer_weights.view(1, -1, 1)
+                        H_eval * int_rule_w.view(1, -1, 1)
                     ).sum(dim=1)
                     int_logit_w_probs_eval = torch.softmax(
                         int_logit_w_logits_eval,
